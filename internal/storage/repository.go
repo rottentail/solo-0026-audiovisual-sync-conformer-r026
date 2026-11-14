@@ -26,7 +26,43 @@ func New(root string) (*Repository, error) {
 			return nil, fmt.Errorf("create data namespace %s: %w", name, err)
 		}
 	}
-	return &Repository{root: absolute, locks: newKeyLocks()}, nil
+	repository := &Repository{root: absolute, locks: newKeyLocks()}
+	if err := repository.reconcileConformAssets(); err != nil {
+		return nil, err
+	}
+	return repository, nil
+}
+
+// reconcileConformAssets removes asset directories that were staged and
+// renamed but never accompanied by a completed conform record, for example
+// when the process was killed between the rename and the record write. A
+// directory is removed only when no conform record owns it, so a completed or
+// in-flight job's published assets are never touched.
+func (r *Repository) reconcileConformAssets() error {
+	entries, err := os.ReadDir(filepath.Join(r.root, "conforms", "assets"))
+	if err != nil {
+		return fmt.Errorf("inspect conform assets: %w", err)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		id := entry.Name()
+		record, err := r.GetConform(id)
+		switch {
+		case err == nil:
+			if record.State == domain.ConformStateCompleted {
+				continue
+			}
+			// No job in a non-terminal state is allowed to have published assets.
+		case !domain.IsErrorCode(err, "conform_not_found"):
+			return fmt.Errorf("read conform %s during reconciliation: %w", id, err)
+		}
+		if err := os.RemoveAll(r.bundleDir(id)); err != nil {
+			return fmt.Errorf("reconcile orphaned conform assets %s: %w", id, err)
+		}
+	}
+	return nil
 }
 
 func (r *Repository) Root() string {
@@ -49,8 +85,12 @@ func (r *Repository) conformPath(id string) string {
 	return filepath.Join(r.root, "conforms", id+".json")
 }
 
-func (r *Repository) bundleDir(id string) string {
-	return filepath.Join(r.root, "conforms", "assets", id)
+// bundleDir returns the private asset namespace of one conform job. Assets
+// are keyed by the conform identifier, never by the analysis identifier, so
+// several conforms of one analysis each keep their own bundle and receipt and
+// no job can rename over or delete another job's published directory.
+func (r *Repository) bundleDir(conformID string) string {
+	return filepath.Join(r.root, "conforms", "assets", conformID)
 }
 
 func (r *Repository) GetTake(id string) (domain.MediaTake, error) {
@@ -307,13 +347,19 @@ func (r *Repository) CommitConform(
 	if err := syncDirectory(tempDir); err != nil {
 		return domain.ConformJob{}, fmt.Errorf("sync bundle staging directory: %w", err)
 	}
-	finalDir := r.bundleDir(record.AnalysisID)
+	finalDir := r.bundleDir(record.ID)
 	if _, err := os.Stat(finalDir); err == nil {
-		if err := os.RemoveAll(finalDir); err != nil {
-			return domain.ConformJob{}, fmt.Errorf("replace analysis bundle assets: %w", err)
-		}
+		// A published namespace for this exact conform already exists. Terminal
+		// states prevent re-rendering, so this is an unexpected duplicate rather
+		// than another conform's assets; never remove it here.
+		return domain.ConformJob{}, domain.NewError(
+			"conform_bundle_conflict",
+			409,
+			"bundle %s already exists",
+			record.ID,
+		)
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return domain.ConformJob{}, fmt.Errorf("inspect analysis bundle assets: %w", err)
+		return domain.ConformJob{}, fmt.Errorf("inspect bundle assets: %w", err)
 	}
 	if err := os.Rename(tempDir, finalDir); err != nil {
 		if errors.Is(err, os.ErrExist) {
@@ -326,10 +372,14 @@ func (r *Repository) CommitConform(
 		}
 		return domain.ConformJob{}, fmt.Errorf("commit bundle directory: %w", err)
 	}
+	if err := syncDirectory(filepath.Dir(finalDir)); err != nil {
+		return domain.ConformJob{}, fmt.Errorf("sync bundle parent directory: %w", err)
+	}
 	record.State = domain.ConformStateCompleted
 	record.UpdatedAt = time.Now().UTC()
 	if err := r.writeConform(record); err != nil {
-		os.RemoveAll(finalDir)
+		// Only this conform's own private namespace is rolled back.
+		_ = os.RemoveAll(finalDir)
 		return domain.ConformJob{}, err
 	}
 	return record, nil
@@ -348,7 +398,7 @@ func (r *Repository) ReadConformBundle(id string) ([]byte, domain.ConformReceipt
 			id,
 		)
 	}
-	bundle, err := os.ReadFile(filepath.Join(r.bundleDir(record.AnalysisID), "bundle.zip"))
+	bundle, err := os.ReadFile(filepath.Join(r.bundleDir(record.ID), "bundle.zip"))
 	if err != nil {
 		return nil, domain.ConformReceipt{}, fmt.Errorf("read conform bundle: %w", err)
 	}
@@ -360,34 +410,19 @@ func (r *Repository) ReadConformBundle(id string) ([]byte, domain.ConformReceipt
 		)
 	}
 	var receipt domain.ConformReceipt
-	if err := readJSON(filepath.Join(r.bundleDir(record.AnalysisID), "receipt.json"), &receipt); err != nil {
+	if err := readJSON(filepath.Join(r.bundleDir(record.ID), "receipt.json"), &receipt); err != nil {
 		return nil, domain.ConformReceipt{}, fmt.Errorf("read conform receipt: %w", err)
 	}
+	if receipt.ConformID != record.ID {
+		return nil, domain.ConformReceipt{}, domain.NewError(
+			"bundle_integrity_failed",
+			500,
+			"stored receipt belongs to conform %s instead of %s",
+			receipt.ConformID,
+			record.ID,
+		)
+	}
 	return bundle, receipt, nil
-}
-
-func (r *Repository) DiscardConformAssets(analysisID string) error {
-	entries, err := os.ReadDir(filepath.Join(r.root, "conforms"))
-	if err != nil {
-		return fmt.Errorf("list conform records for asset cleanup: %w", err)
-	}
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
-			continue
-		}
-		id := entry.Name()[:len(entry.Name())-len(".json")]
-		var record domain.ConformJob
-		if err := readJSON(r.conformPath(id), &record); err != nil {
-			return fmt.Errorf("read conform for asset cleanup: %w", err)
-		}
-		if record.AnalysisID != analysisID && record.ID != analysisID {
-			continue
-		}
-		if err := os.RemoveAll(r.bundleDir(record.AnalysisID)); err != nil {
-			return fmt.Errorf("discard analysis bundle assets: %w", err)
-		}
-	}
-	return nil
 }
 
 func (r *Repository) writeConform(record domain.ConformJob) error {

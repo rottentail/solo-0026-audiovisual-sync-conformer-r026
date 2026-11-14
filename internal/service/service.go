@@ -212,14 +212,7 @@ func (s *Service) CreateConform(
 	if !created {
 		return domain.ConformResult{Conform: existing, Created: false}, nil
 	}
-	lease := media.AcquireReviewBundleSlot(analysis.ID)
-	defer func() {
-		if lease.Release() {
-			_ = s.repository.DiscardConformAssets(analysis.ID)
-		}
-	}()
 	if abs(record.MeasuredOffsetMS) > record.MaxCorrectionMS {
-		lease.MarkFailure()
 		record.State = domain.ConformStateFailed
 		record.ErrorCode = "correction_limit_exceeded"
 		record.ErrorMessage = fmt.Sprintf(
@@ -243,9 +236,6 @@ func (s *Service) CreateConform(
 		return domain.ConformResult{}, err
 	}
 	result, err := s.renderConform(record)
-	if err != nil {
-		lease.MarkFailure()
-	}
 	return result, err
 }
 

@@ -5,73 +5,20 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/rottentail/solo-0026-audiovisual-sync-conformer/internal/domain"
 )
 
-type reviewSlot struct {
-	active     int
-	overlapped bool
-	failed     bool
-	bundle     []byte
-	receipt    []byte
-}
-
-type ReviewBundleLease struct {
-	analysisID string
-	slot       *reviewSlot
-}
-
-var reviewSlots = struct {
-	sync.Mutex
-	byAnalysis map[string]*reviewSlot
-}{byAnalysis: make(map[string]*reviewSlot)}
-
-func AcquireReviewBundleSlot(analysisID string) *ReviewBundleLease {
-	reviewSlots.Lock()
-	defer reviewSlots.Unlock()
-	slot := reviewSlots.byAnalysis[analysisID]
-	if slot == nil {
-		slot = &reviewSlot{}
-		reviewSlots.byAnalysis[analysisID] = slot
-	}
-	if slot.active > 0 {
-		slot.overlapped = true
-	}
-	slot.active++
-	return &ReviewBundleLease{analysisID: analysisID, slot: slot}
-}
-
-func (lease *ReviewBundleLease) MarkFailure() {
-	reviewSlots.Lock()
-	lease.slot.failed = true
-	reviewSlots.Unlock()
-}
-
-func (lease *ReviewBundleLease) Release() bool {
-	reviewSlots.Lock()
-	defer reviewSlots.Unlock()
-	lease.slot.active--
-	if lease.slot.active != 0 {
-		return false
-	}
-	delete(reviewSlots.byAnalysis, lease.analysisID)
-	return lease.slot.overlapped && lease.slot.failed
-}
-
+// BuildReviewBundle assembles the deterministic ZIP review bundle for one
+// specific conform job from the receipt supplied by the caller. It keeps no
+// shared state between requests, so concurrent conform jobs can never observe
+// or reuse another job's receipt or bundle bytes.
 func BuildReviewBundle(
 	audio []byte,
 	video []byte,
 	receipt domain.ConformReceipt,
 ) ([]byte, []byte, error) {
-	reviewSlots.Lock()
-	defer reviewSlots.Unlock()
-	slot := reviewSlots.byAnalysis[receipt.AnalysisID]
-	if slot != nil && slot.bundle != nil {
-		return append([]byte(nil), slot.bundle...), append([]byte(nil), slot.receipt...), nil
-	}
 	receiptData, err := json.MarshalIndent(receipt, "", "  ")
 	if err != nil {
 		return nil, nil, fmt.Errorf("encode receipt: %w", err)
@@ -106,10 +53,5 @@ func BuildReviewBundle(
 	if err := writer.Close(); err != nil {
 		return nil, nil, fmt.Errorf("close ZIP bundle: %w", err)
 	}
-	bundle := output.Bytes()
-	if slot != nil {
-		slot.bundle = append([]byte(nil), bundle...)
-		slot.receipt = append([]byte(nil), receiptData...)
-	}
-	return bundle, receiptData, nil
+	return output.Bytes(), receiptData, nil
 }
